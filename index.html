@@ -40,7 +40,7 @@
     <input id="code" maxlength="11" placeholder="XXXXX-XXXXX" autocomplete="off" autocapitalize="characters" spellcheck="false" autofocus>
     <button id="go">Connect</button>
     <div id="msg"></div>
-    <small>The host must approve each connection. Your screen and input go directly between the two computers, encrypted.</small>
+    <small>Connects directly when possible, or through an encrypted relay on strict networks.</small>
   </div>
 </div>
 
@@ -54,27 +54,37 @@
 const $ = id => document.getElementById(id);
 const NTFY = 'https://ntfy.sh/';
 const canvas = $('screen'), ctx = canvas.getContext('2d');
-let pc, dc, es, timer, live = false, cur = null, busy = false, frames = 0, fpsTimer;
-let switched = false, dispCount = 1, swallow = false, toastTimer;
+let pc, dc, ws, es, live = false, mode = '', gen = 0, timers = [];
+let cur = null, busy = false, frames = 0, fpsTimer, switched = false, swallow = false, toastTimer;
+
+function setMsg(t, err) { $('msg').textContent = t || ''; $('msg').className = err ? 'err' : ''; }
 function toast(t) {
   const el = $('toast'); el.textContent = t; el.style.opacity = 1;
   clearTimeout(toastTimer); toastTimer = setTimeout(() => el.style.opacity = 0, 1800);
 }
-function switchDisplay() { switched = true; send({ t: 'switch' }); }
-
-function setMsg(t, err) { $('msg').textContent = t || ''; $('msg').className = err ? 'err' : ''; }
 
 function end(msg, err = true) {
-  clearTimeout(timer); clearInterval(fpsTimer);
-  live = false;
-  try { es && es.close(); } catch {}
-  try { dc && dc.close(); } catch {}
-  try { pc && pc.close(); } catch {}
+  gen++;                                   // invalidates every callback of the old session
+  timers.forEach(clearTimeout); timers = []; clearInterval(fpsTimer);
+  live = false; mode = ''; cur = null;
+  for (const o of [es, dc, pc, ws]) { try { o && o.close(); } catch {} }
+  es = dc = pc = ws = null;
   if (document.fullscreenElement) document.exitFullscreen();
   $('stream').style.display = 'none';
   $('login').style.display = 'grid';
   $('go').disabled = false;
   setMsg(msg, err);
+}
+
+function goLive(kind, my) {
+  if (live || my !== gen) return false;
+  live = true; mode = kind;
+  timers.forEach(clearTimeout); timers = [];
+  setMsg('');
+  $('login').style.display = 'none'; $('stream').style.display = 'block'; canvas.focus();
+  fpsTimer = setInterval(() => { $('fps').textContent = frames + ' fps · ' + (mode === 'rtc' ? 'direct' : 'relay'); frames = 0; }, 1000);
+  try { es && es.close(); } catch {}
+  return true;
 }
 
 const gathered = p => new Promise(res => {
@@ -85,87 +95,7 @@ const gathered = p => new Promise(res => {
   });
 });
 
-async function connect() {
-  const code = $('code').value.toUpperCase().replace(/[^A-Z0-9]/g, '');
-  if (code.length !== 10) return setMsg('Codes are 10 characters, like K7M2Q-X9P4R.', true);
-  $('go').disabled = true;
-  setMsg('Connecting…');
-
-  const topic = NTFY + 'rdesk-v1-' + code.toLowerCase();
-  const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
-
-  try {
-    // 1) Ask the host for its network config (STUN + optional TURN relay). Keeps relay credentials off this public site.
-    es = new EventSource(topic + '/sse');
-    await new Promise((res, rej) => {
-      es.addEventListener('open', res, { once: true });
-      es.onerror = () => rej(new Error('Could not reach the signaling service.'));
-    });
-    es.onerror = null;
-    const ice = await new Promise((res, rej) => {
-      const t = setTimeout(() => rej(new Error('Host not found. Check the code and that the host app is running.')), 15000);
-      es.onmessage = ev => {
-        let e, m;
-        try { e = JSON.parse(ev.data); m = JSON.parse(e.message); } catch { return; }
-        if (e.event === 'message' && m.type === 'config' && m.id === id) { clearTimeout(t); res(m.ice); }
-      };
-      fetch(topic, { method: 'POST', body: JSON.stringify({ type: 'hello', id }) }).catch(rej);
-    });
-    pc = new RTCPeerConnection({ iceServers: ice });
-    dc = pc.createDataChannel('screen');
-    dc.binaryType = 'arraybuffer';
-    dc.onmessage = onFrame;
-    dc.onopen = () => {
-      live = true; clearTimeout(timer); setMsg('');
-      $('login').style.display = 'none'; $('stream').style.display = 'block'; canvas.focus();
-      fpsTimer = setInterval(() => { $('fps').textContent = frames + ' fps'; frames = 0; }, 1000);
-      try { es.close(); } catch {}
-    };
-    dc.onclose = () => { if (live) end('Disconnected.'); };
-    pc.onconnectionstatechange = () => {
-      if (['failed', 'closed'].includes(pc.connectionState)) end(live ? 'Connection lost.' : 'Could not connect. A strict network may need a TURN relay (see the host setup notes).');
-    };
-
-    // 2) Wait for the host's answer
-    es.onmessage = async ev => {
-      let e, m;
-      try { e = JSON.parse(ev.data); m = JSON.parse(e.message); } catch { return; }
-      if (e.event !== 'message' || m.id !== id) return;
-      if (m.type === 'answer') await pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });
-      else if (m.type === 'denied') end('The host declined the connection.');
-    };
-
-    await pc.setLocalDescription(await pc.createOffer());
-    await gathered(pc);
-    await fetch(topic, { method: 'POST', body: JSON.stringify({ type: 'offer', id, sdp: pc.localDescription.sdp }) });
-    setMsg('Connecting to your computer…');
-    timer = setTimeout(() => { if (!live) end('Could not connect. Your network may need a relay (see the host setup notes).'); }, 30000);
-  } catch (err) {
-    end(err.message || 'Connection failed.');
-  }
-}
-
-// Frames arrive as chunks: [frameId u32][index u16][total u16][jpeg bytes]
-async function onFrame(e) {
-  if (typeof e.data === 'string') {
-    try {
-      const m = JSON.parse(e.data);
-      if (m.type === 'display') {
-        dispCount = m.count;
-        $('disp').textContent = m.count > 1 ? 'Display ' + m.index + '/' + m.count : '';
-        if (switched) toast(m.count > 1 ? 'Display ' + m.index + ' of ' + m.count : 'Only one display found');
-        switched = false;
-      }
-    } catch {}
-    return;
-  }
-  const v = new DataView(e.data);
-  const fid = v.getUint32(0), idx = v.getUint16(4), total = v.getUint16(6);
-  if (!cur || cur.fid !== fid) cur = { fid, parts: new Array(total), got: 0, total };
-  if (!cur.parts[idx]) { cur.parts[idx] = new Uint8Array(e.data, 8); cur.got++; }
-  if (cur.got < cur.total) return;
-  const blob = new Blob(cur.parts, { type: 'image/jpeg' });
-  cur = null;
+async function draw(blob) {
   if (busy) return;
   busy = true;
   try {
@@ -176,8 +106,114 @@ async function onFrame(e) {
   busy = false;
 }
 
-// ---- remote input ----
-const send = o => { if (dc && dc.readyState === 'open') dc.send(JSON.stringify(o)); };
+function handleCtl(str) {
+  try {
+    const m = JSON.parse(str);
+    if (m.type === 'display') {
+      $('disp').textContent = m.count > 1 ? 'Display ' + m.index + '/' + m.count : '';
+      if (switched) toast(m.count > 1 ? 'Display ' + m.index + ' of ' + m.count : 'Only one display found');
+      switched = false;
+    }
+  } catch {}
+}
+
+// Direct mode: frames arrive as chunks [frameId u32][index u16][total u16][jpeg bytes]
+function onRtcData(e) {
+  if (typeof e.data === 'string') return handleCtl(e.data);
+  const v = new DataView(e.data);
+  const fid = v.getUint32(0), idx = v.getUint16(4), total = v.getUint16(6);
+  if (!cur || cur.fid !== fid) cur = { fid, parts: new Array(total), got: 0, total };
+  if (!cur.parts[idx]) { cur.parts[idx] = new Uint8Array(e.data, 8); cur.got++; }
+  if (cur.got < cur.total) return;
+  const blob = new Blob(cur.parts, { type: 'image/jpeg' });
+  cur = null;
+  draw(blob);
+}
+
+function startWs(url, my) {
+  if (live || my !== gen) return;
+  setMsg('Direct connection blocked. Using relay…');
+  const w = new WebSocket(url);
+  w.binaryType = 'blob';
+  ws = w;
+  w.onopen = () => { if (!goLive('ws', my)) w.close(); };
+  w.onmessage = e => { if (my !== gen) return; typeof e.data === 'string' ? handleCtl(e.data) : draw(e.data); };
+  w.onclose = () => { if (my === gen && live && mode === 'ws') end('Disconnected.'); };
+}
+
+async function connect() {
+  const code = $('code').value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (code.length !== 10) return setMsg('Codes are 10 characters, like K7M2Q-X9P4R.', true);
+  $('go').disabled = true;
+  setMsg('Connecting…');
+  const my = ++gen;
+  const topic = NTFY + 'rdesk-v1-' + code.toLowerCase();
+  const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+  try {
+    // 1) Ask the host for its network config (STUN/TURN + relay address) over the private channel
+    es = new EventSource(topic + '/sse');
+    await new Promise((res, rej) => {
+      es.addEventListener('open', res, { once: true });
+      es.onerror = () => rej(new Error('Could not reach the signaling service (ntfy.sh may be blocked on this network).'));
+    });
+    es.onerror = null;
+    const cfg = await new Promise((res, rej) => {
+      const t = setTimeout(() => rej(new Error('Host not found. Check the code and that the host app is running.')), 15000);
+      es.onmessage = ev => {
+        let e, m;
+        try { e = JSON.parse(ev.data); m = JSON.parse(e.message); } catch { return; }
+        if (e.event === 'message' && m.type === 'config' && m.id === id) { clearTimeout(t); res(m); }
+      };
+      fetch(topic, { method: 'POST', body: JSON.stringify({ type: 'hello', id }) }).catch(rej);
+    });
+    if (my !== gen) return;
+
+    // 2) Try a direct connection; fall back to the relay if it doesn't work quickly
+    const fallback = () => {
+      if (live || my !== gen) return;
+      if (cfg.ws) startWs(cfg.ws, my);
+    };
+    pc = new RTCPeerConnection({ iceServers: cfg.ice });
+    dc = pc.createDataChannel('screen');
+    dc.binaryType = 'arraybuffer';
+    dc.onmessage = e => { if (my === gen) onRtcData(e); };
+    dc.onopen = () => { if (!goLive('rtc', my)) dc.close(); };
+    dc.onclose = () => { if (my === gen && live && mode === 'rtc') end('Disconnected.'); };
+    pc.onconnectionstatechange = () => {
+      if (my !== gen) return;
+      if (['failed', 'closed'].includes(pc.connectionState)) {
+        if (live && mode === 'rtc') end('Connection lost.');
+        else if (!live) fallback();
+      }
+    };
+    es.onmessage = async ev => {
+      let e, m;
+      try { e = JSON.parse(ev.data); m = JSON.parse(e.message); } catch { return; }
+      if (e.event !== 'message' || m.id !== id || my !== gen) return;
+      if (m.type === 'answer') await pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });
+      else if (m.type === 'denied') end('The host declined the connection.');
+    };
+
+    await pc.setLocalDescription(await pc.createOffer());
+    await gathered(pc);
+    if (my !== gen) return;
+    await fetch(topic, { method: 'POST', body: JSON.stringify({ type: 'offer', id, sdp: pc.localDescription.sdp }) });
+    setMsg('Connecting to your computer…');
+    timers.push(setTimeout(fallback, 8000));
+    timers.push(setTimeout(() => { if (!live) end('Could not connect. Make sure the host app is running and shows "Relay tunnel ready".'); }, 45000));
+  } catch (err) {
+    if (my === gen) end(err.message || 'Connection failed.');
+  }
+}
+
+// ---- remote input (works over either transport) ----
+function send(o) {
+  const s = JSON.stringify(o);
+  if (mode === 'rtc' && dc && dc.readyState === 'open') dc.send(s);
+  else if (mode === 'ws' && ws && ws.readyState === 1) ws.send(s);
+}
+function switchDisplay() { switched = true; send({ t: 'switch' }); }
 function pos(e) {
   const r = canvas.getBoundingClientRect();
   const s = Math.min(r.width / canvas.width, r.height / canvas.height);
@@ -216,7 +252,7 @@ $('code').addEventListener('input', e => {
 $('sw').onclick = () => { switchDisplay(); canvas.focus(); };
 $('fs').onclick = async () => {
   await $('stream').requestFullscreen();
-  try { await navigator.keyboard?.lock?.(); } catch {}  // lets Alt+Tab, Esc etc. reach the host (Chrome/Edge)
+  try { await navigator.keyboard?.lock?.(); } catch {}
   canvas.focus();
 };
 $('dc').onclick = () => end('Disconnected.', false);

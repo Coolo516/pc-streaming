@@ -28,6 +28,7 @@
   #bar{position:fixed;top:10px;right:10px;display:flex;gap:8px;align-items:center;opacity:.3;transition:opacity .2s;color:#fff;font-size:13px}
   #bar:hover{opacity:1}
   #bar button{padding:7px 12px;font-size:13px;background:#333}
+  #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.8);color:#fff;padding:10px 18px;border-radius:10px;font-size:14px;opacity:0;pointer-events:none;transition:opacity .25s}
 </style>
 </head>
 <body>
@@ -45,7 +46,8 @@
 
 <div id="stream">
   <canvas id="screen" tabindex="0"></canvas>
-  <div id="bar"><span id="fps"></span><button id="fs">Fullscreen</button><button id="dc">Disconnect</button></div>
+  <div id="bar"><span id="disp"></span><span id="fps"></span><button id="sw" title="Shortcut: Alt+1">Switch display</button><button id="fs">Fullscreen</button><button id="dc">Disconnect</button></div>
+  <div id="toast"></div>
 </div>
 
 <script>
@@ -53,6 +55,12 @@ const $ = id => document.getElementById(id);
 const NTFY = 'https://ntfy.sh/';
 const canvas = $('screen'), ctx = canvas.getContext('2d');
 let pc, dc, es, timer, live = false, cur = null, busy = false, frames = 0, fpsTimer;
+let switched = false, dispCount = 1, swallow = false, toastTimer;
+function toast(t) {
+  const el = $('toast'); el.textContent = t; el.style.opacity = 1;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => el.style.opacity = 0, 1800);
+}
+function switchDisplay() { switched = true; send({ t: 'switch' }); }
 
 function setMsg(t, err) { $('msg').textContent = t || ''; $('msg').className = err ? 'err' : ''; }
 
@@ -129,7 +137,18 @@ async function connect() {
 
 // Frames arrive as chunks: [frameId u32][index u16][total u16][jpeg bytes]
 async function onFrame(e) {
-  if (typeof e.data === 'string') return;
+  if (typeof e.data === 'string') {
+    try {
+      const m = JSON.parse(e.data);
+      if (m.type === 'display') {
+        dispCount = m.count;
+        $('disp').textContent = m.count > 1 ? 'Display ' + m.index + '/' + m.count : '';
+        if (switched) toast(m.count > 1 ? 'Display ' + m.index + ' of ' + m.count : 'Only one display found');
+        switched = false;
+      }
+    } catch {}
+    return;
+  }
   const v = new DataView(e.data);
   const fid = v.getUint32(0), idx = v.getUint16(4), total = v.getUint16(6);
   if (!cur || cur.fid !== fid) cur = { fid, parts: new Array(total), got: 0, total };
@@ -166,8 +185,17 @@ canvas.addEventListener('mousedown', e => { e.preventDefault(); canvas.focus(); 
 canvas.addEventListener('mouseup', e => { e.preventDefault(); send({ t: 'mouse', a: 'up', b: e.button, ...pos(e) }); });
 canvas.addEventListener('contextmenu', e => e.preventDefault());
 canvas.addEventListener('wheel', e => { e.preventDefault(); send({ t: 'wheel', dy: e.deltaY }); }, { passive: false });
-canvas.addEventListener('keydown', e => { e.preventDefault(); send({ t: 'key', a: 'down', k: e.key }); });
-canvas.addEventListener('keyup', e => { e.preventDefault(); send({ t: 'key', a: 'up', k: e.key }); });
+const isOne = e => e.code === 'Digit1' || e.code === 'Numpad1';
+canvas.addEventListener('keydown', e => {
+  e.preventDefault();
+  if (e.altKey && isOne(e)) { if (!e.repeat) switchDisplay(); swallow = true; return; }  // Alt+1 = next display
+  send({ t: 'key', a: 'down', k: e.key });
+});
+canvas.addEventListener('keyup', e => {
+  e.preventDefault();
+  if (swallow && isOne(e)) { swallow = false; return; }
+  send({ t: 'key', a: 'up', k: e.key });
+});
 
 $('go').onclick = connect;
 $('code').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
@@ -175,7 +203,12 @@ $('code').addEventListener('input', e => {
   let v = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10);
   e.target.value = v.length > 5 ? v.slice(0, 5) + '-' + v.slice(5) : v;
 });
-$('fs').onclick = () => { $('stream').requestFullscreen(); canvas.focus(); };
+$('sw').onclick = () => { switchDisplay(); canvas.focus(); };
+$('fs').onclick = async () => {
+  await $('stream').requestFullscreen();
+  try { await navigator.keyboard?.lock?.(); } catch {}  // lets Alt+Tab, Esc etc. reach the host (Chrome/Edge)
+  canvas.focus();
+};
 $('dc').onclick = () => end('Disconnected.', false);
 </script>
 </body>

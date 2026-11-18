@@ -46,7 +46,7 @@
 
 <div id="stream">
   <canvas id="screen" tabindex="0"></canvas>
-  <div id="bar"><span id="disp"></span><span id="fps"></span><button id="sw" title="Shortcut: Alt+1">Switch display</button><button id="fs">Fullscreen</button><button id="dc">Disconnect</button></div>
+  <div id="bar"><span id="disp"></span><span id="fps"></span><button id="sw" title="Shortcut: Ctrl+1">Switch display</button><button id="fs">Fullscreen</button><button id="dc">Disconnect</button></div>
   <div id="toast"></div>
 </div>
 
@@ -79,7 +79,7 @@ function end(msg, err = true) {
 
 const gathered = p => new Promise(res => {
   if (p.iceGatheringState === 'complete') return res();
-  const t = setTimeout(res, 4000);
+  const t = setTimeout(res, 5000);
   p.addEventListener('icegatheringstatechange', () => {
     if (p.iceGatheringState === 'complete') { clearTimeout(t); res(); }
   });
@@ -95,7 +95,23 @@ async function connect() {
   const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
 
   try {
-    pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    // 1) Ask the host for its network config (STUN + optional TURN relay). Keeps relay credentials off this public site.
+    es = new EventSource(topic + '/sse');
+    await new Promise((res, rej) => {
+      es.addEventListener('open', res, { once: true });
+      es.onerror = () => rej(new Error('Could not reach the signaling service.'));
+    });
+    es.onerror = null;
+    const ice = await new Promise((res, rej) => {
+      const t = setTimeout(() => rej(new Error('Host not found. Check the code and that the host app is running.')), 15000);
+      es.onmessage = ev => {
+        let e, m;
+        try { e = JSON.parse(ev.data); m = JSON.parse(e.message); } catch { return; }
+        if (e.event === 'message' && m.type === 'config' && m.id === id) { clearTimeout(t); res(m.ice); }
+      };
+      fetch(topic, { method: 'POST', body: JSON.stringify({ type: 'hello', id }) }).catch(rej);
+    });
+    pc = new RTCPeerConnection({ iceServers: ice });
     dc = pc.createDataChannel('screen');
     dc.binaryType = 'arraybuffer';
     dc.onmessage = onFrame;
@@ -107,16 +123,10 @@ async function connect() {
     };
     dc.onclose = () => { if (live) end('Disconnected.'); };
     pc.onconnectionstatechange = () => {
-      if (['failed', 'closed'].includes(pc.connectionState)) end(live ? 'Connection lost.' : 'Could not establish a connection (network may block it).');
+      if (['failed', 'closed'].includes(pc.connectionState)) end(live ? 'Connection lost.' : 'Could not connect. A strict network may need a TURN relay (see the host setup notes).');
     };
 
-    // Listen for the host's answer on the private topic
-    es = new EventSource(topic + '/sse');
-    await new Promise((res, rej) => {
-      es.addEventListener('open', res, { once: true });
-      es.onerror = () => rej(new Error('Could not reach the signaling service.'));
-    });
-    es.onerror = null;
+    // 2) Wait for the host's answer
     es.onmessage = async ev => {
       let e, m;
       try { e = JSON.parse(ev.data); m = JSON.parse(e.message); } catch { return; }
@@ -128,8 +138,8 @@ async function connect() {
     await pc.setLocalDescription(await pc.createOffer());
     await gathered(pc);
     await fetch(topic, { method: 'POST', body: JSON.stringify({ type: 'offer', id, sdp: pc.localDescription.sdp }) });
-    setMsg('Waiting for the host to approve…');
-    timer = setTimeout(() => { if (!live) end('No response. Check the code and that the host app is running.'); }, 90000);
+    setMsg('Connecting to your computer…');
+    timer = setTimeout(() => { if (!live) end('Could not connect. Your network may need a relay (see the host setup notes).'); }, 30000);
   } catch (err) {
     end(err.message || 'Connection failed.');
   }
@@ -188,7 +198,7 @@ canvas.addEventListener('wheel', e => { e.preventDefault(); send({ t: 'wheel', d
 const isOne = e => e.code === 'Digit1' || e.code === 'Numpad1';
 canvas.addEventListener('keydown', e => {
   e.preventDefault();
-  if (e.altKey && isOne(e)) { if (!e.repeat) switchDisplay(); swallow = true; return; }  // Alt+1 = next display
+  if (e.ctrlKey && isOne(e)) { if (!e.repeat) switchDisplay(); swallow = true; return; }  // Ctrl+1 = next display
   send({ t: 'key', a: 'down', k: e.key });
 });
 canvas.addEventListener('keyup', e => {

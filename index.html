@@ -1,0 +1,166 @@
+"""
+Host app - run on the PC you want to control.
+    pip install -r requirements.txt
+    python host.py            (add --view-only to disable remote mouse/keyboard)
+Prints a connection code. Enter it on your website.
+"""
+import argparse, asyncio, hashlib, io, json, re, secrets, struct, threading
+from concurrent.futures import ThreadPoolExecutor
+
+import aiohttp, mss, pyautogui
+from PIL import Image
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0
+
+NTFY = "https://ntfy.sh/"
+ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+CHUNK = 16000
+POOL = ThreadPoolExecutor(max_workers=1)  # screen capture must stay on one thread
+_local = threading.local()
+
+with mss.mss() as _s:
+    MON = dict(_s.monitors[1])  # primary monitor
+
+KEYMAP = {
+    "Enter": "enter", "Backspace": "backspace", "Tab": "tab", "Escape": "esc",
+    "ArrowLeft": "left", "ArrowRight": "right", "ArrowUp": "up", "ArrowDown": "down",
+    "Delete": "delete", "Home": "home", "End": "end", "PageUp": "pageup", "PageDown": "pagedown",
+    "Control": "ctrl", "Shift": "shift", "Alt": "alt", "Meta": "win", "CapsLock": "capslock",
+    "Insert": "insert", " ": "space",
+}
+
+
+def grab_frame(max_width, quality):
+    if not hasattr(_local, "sct"):
+        _local.sct = mss.mss()
+    shot = _local.sct.grab(MON)
+    img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+    if img.width > max_width:
+        img = img.resize((max_width, int(img.height * max_width / img.width)), Image.BILINEAR)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=quality)
+    return buf.getvalue()
+
+
+def apply_input(m):
+    t = m.get("t")
+    try:
+        if t in ("move", "mouse"):
+            pyautogui.moveTo(MON["left"] + float(m["x"]) * MON["width"],
+                             MON["top"] + float(m["y"]) * MON["height"], _pause=False)
+            if t == "mouse":
+                btn = {0: "left", 1: "middle", 2: "right"}.get(m.get("b"), "left")
+                (pyautogui.mouseDown if m["a"] == "down" else pyautogui.mouseUp)(button=btn, _pause=False)
+        elif t == "wheel":
+            pyautogui.scroll(-int(m["dy"]), _pause=False)
+        elif t == "key":
+            k = KEYMAP.get(m["k"], m["k"].lower())
+            if re.fullmatch(r"f\d{1,2}", k) or k in pyautogui.KEYBOARD_KEYS:
+                (pyautogui.keyDown if m["a"] == "down" else pyautogui.keyUp)(k, _pause=False)
+    except Exception as e:
+        print("input error:", e)
+
+
+async def stream(ch, args):
+    loop = asyncio.get_running_loop()
+    fid, last = 0, None
+    print("Viewer connected.")
+    while ch.readyState == "open":
+        if ch.bufferedAmount > 262144:  # viewer is behind; don't pile up frames
+            await asyncio.sleep(0.02)
+            continue
+        frame = await loop.run_in_executor(POOL, grab_frame, args.width, args.quality)
+        h = hashlib.md5(frame).digest()
+        if h != last:  # skip unchanged screens
+            last = h
+            fid = (fid + 1) & 0xFFFFFFFF
+            parts = [frame[i:i + CHUNK] for i in range(0, len(frame), CHUNK)]
+            for i, p in enumerate(parts):
+                ch.send(struct.pack(">IHH", fid, i, len(parts)) + p)
+        await asyncio.sleep(1 / args.fps)
+    print("Viewer disconnected.")
+
+
+async def main(args):
+    raw = "".join(secrets.choice(ALPHABET) for _ in range(10))
+    topic = NTFY + "rdesk-v1-" + raw.lower()
+    state = {"pc": None, "busy": False}
+
+    print("\n==============================")
+    print(f"  CONNECTION CODE:  {raw[:5]}-{raw[5:]}")
+    print("==============================")
+    print("Enter it on the website. Ctrl+C to stop.\n")
+
+    async with aiohttp.ClientSession() as http:
+        async def publish(obj):
+            await http.post(topic, data=json.dumps(obj))
+
+        async def on_offer(m):
+            if state["busy"]:
+                return
+            state["busy"] = True
+            try:
+                if not args.no_confirm:
+                    ans = await asyncio.to_thread(input, "\nSomeone is requesting access. Allow? [y/N] ")
+                    if ans.strip().lower() != "y":
+                        await publish({"type": "denied", "id": m["id"]})
+                        return
+                if state["pc"]:
+                    await state["pc"].close()
+                pc = RTCPeerConnection(RTCConfiguration([RTCIceServer("stun:stun.l.google.com:19302")]))
+                state["pc"] = pc
+
+                @pc.on("datachannel")
+                def _(ch):
+                    @ch.on("message")
+                    def _(msg):
+                        if isinstance(msg, str) and not args.view_only:
+                            apply_input(json.loads(msg))
+                    asyncio.ensure_future(stream(ch, args))
+
+                @pc.on("connectionstatechange")
+                async def _():
+                    if pc.connectionState in ("failed", "closed"):
+                        await pc.close()
+
+                await pc.setRemoteDescription(RTCSessionDescription(sdp=m["sdp"], type="offer"))
+                await pc.setLocalDescription(await pc.createAnswer())
+                await publish({"type": "answer", "id": m["id"], "sdp": pc.localDescription.sdp})
+            except Exception as e:
+                print("connection error:", e)
+            finally:
+                state["busy"] = False
+
+        while True:  # listen on the private topic, reconnect if dropped
+            try:
+                async with http.get(topic + "/sse", timeout=aiohttp.ClientTimeout(total=None, sock_read=120)) as r:
+                    async for line in r.content:
+                        line = line.decode().strip()
+                        if not line.startswith("data:"):
+                            continue
+                        ev = json.loads(line[5:])
+                        if ev.get("event") != "message":
+                            continue
+                        try:
+                            m = json.loads(ev["message"])
+                        except Exception:
+                            continue
+                        if m.get("type") == "offer":
+                            asyncio.ensure_future(on_offer(m))
+            except Exception:
+                await asyncio.sleep(2)
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--fps", type=int, default=15)
+    p.add_argument("--width", type=int, default=1280, help="max stream width in pixels")
+    p.add_argument("--quality", type=int, default=55, help="JPEG quality 1-95")
+    p.add_argument("--view-only", action="store_true", help="ignore remote mouse/keyboard")
+    p.add_argument("--no-confirm", action="store_true", help="don't ask before accepting a viewer")
+    try:
+        asyncio.run(main(p.parse_args()))
+    except KeyboardInterrupt:
+        print("Stopped.")

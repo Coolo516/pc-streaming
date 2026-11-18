@@ -1,166 +1,182 @@
-"""
-Host app - run on the PC you want to control.
-    pip install -r requirements.txt
-    python host.py            (add --view-only to disable remote mouse/keyboard)
-Prints a connection code. Enter it on your website.
-"""
-import argparse, asyncio, hashlib, io, json, re, secrets, struct, threading
-from concurrent.futures import ThreadPoolExecutor
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remote Desktop</title>
+<style>
+  :root{--bg:#0f1115;--card:#181b22;--fg:#e8eaf0;--mut:#8b93a7;--acc:#4f8cff;--err:#ff6b6b;--bd:#2a2f3a}
+  @media (prefers-color-scheme: light){:root{--bg:#f3f5f9;--card:#fff;--fg:#14171f;--mut:#5d667a;--bd:#dfe3ec}}
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  #login{min-height:100%;display:grid;place-items:center;padding:20px}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:32px;width:100%;max-width:440px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.2)}
+  .logo{font-size:36px;margin-bottom:6px}
+  h1{margin:0 0 6px;font-size:22px}
+  p{color:var(--mut);margin:0 0 22px;font-size:14px;line-height:1.5}
+  #code{width:100%;font:600 26px ui-monospace,Menlo,Consolas,monospace;letter-spacing:3px;text-align:center;text-transform:uppercase;padding:14px;border-radius:10px;border:1px solid var(--bd);background:var(--bg);color:var(--fg);outline:none}
+  #code:focus{border-color:var(--acc)}
+  button{font:600 15px system-ui,sans-serif;border:0;border-radius:10px;cursor:pointer;color:#fff;background:var(--acc)}
+  #go{width:100%;padding:14px;margin-top:14px}
+  #go:disabled{opacity:.6;cursor:wait}
+  #msg{min-height:20px;margin-top:14px;font-size:14px;color:var(--mut)}
+  #msg.err{color:var(--err)}
+  small{display:block;margin-top:18px;color:var(--mut);font-size:12px;line-height:1.5}
+  #stream{position:fixed;inset:0;background:#000;display:none}
+  canvas{width:100%;height:100%;object-fit:contain;display:block;outline:none;cursor:default}
+  #bar{position:fixed;top:10px;right:10px;display:flex;gap:8px;align-items:center;opacity:.3;transition:opacity .2s;color:#fff;font-size:13px}
+  #bar:hover{opacity:1}
+  #bar button{padding:7px 12px;font-size:13px;background:#333}
+</style>
+</head>
+<body>
+<div id="login">
+  <div class="card">
+    <div class="logo">🖥️</div>
+    <h1>Connect to a computer</h1>
+    <p>Run the host app on the computer you want to control, then enter the connection code it shows.</p>
+    <input id="code" maxlength="11" placeholder="XXXXX-XXXXX" autocomplete="off" autocapitalize="characters" spellcheck="false" autofocus>
+    <button id="go">Connect</button>
+    <div id="msg"></div>
+    <small>The host must approve each connection. Your screen and input go directly between the two computers, encrypted.</small>
+  </div>
+</div>
 
-import aiohttp, mss, pyautogui
-from PIL import Image
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+<div id="stream">
+  <canvas id="screen" tabindex="0"></canvas>
+  <div id="bar"><span id="fps"></span><button id="fs">Fullscreen</button><button id="dc">Disconnect</button></div>
+</div>
 
-pyautogui.FAILSAFE = False
-pyautogui.PAUSE = 0
+<script>
+const $ = id => document.getElementById(id);
+const NTFY = 'https://ntfy.sh/';
+const canvas = $('screen'), ctx = canvas.getContext('2d');
+let pc, dc, es, timer, live = false, cur = null, busy = false, frames = 0, fpsTimer;
 
-NTFY = "https://ntfy.sh/"
-ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
-CHUNK = 16000
-POOL = ThreadPoolExecutor(max_workers=1)  # screen capture must stay on one thread
-_local = threading.local()
+function setMsg(t, err) { $('msg').textContent = t || ''; $('msg').className = err ? 'err' : ''; }
 
-with mss.mss() as _s:
-    MON = dict(_s.monitors[1])  # primary monitor
-
-KEYMAP = {
-    "Enter": "enter", "Backspace": "backspace", "Tab": "tab", "Escape": "esc",
-    "ArrowLeft": "left", "ArrowRight": "right", "ArrowUp": "up", "ArrowDown": "down",
-    "Delete": "delete", "Home": "home", "End": "end", "PageUp": "pageup", "PageDown": "pagedown",
-    "Control": "ctrl", "Shift": "shift", "Alt": "alt", "Meta": "win", "CapsLock": "capslock",
-    "Insert": "insert", " ": "space",
+function end(msg, err = true) {
+  clearTimeout(timer); clearInterval(fpsTimer);
+  live = false;
+  try { es && es.close(); } catch {}
+  try { dc && dc.close(); } catch {}
+  try { pc && pc.close(); } catch {}
+  if (document.fullscreenElement) document.exitFullscreen();
+  $('stream').style.display = 'none';
+  $('login').style.display = 'grid';
+  $('go').disabled = false;
+  setMsg(msg, err);
 }
 
+const gathered = p => new Promise(res => {
+  if (p.iceGatheringState === 'complete') return res();
+  const t = setTimeout(res, 4000);
+  p.addEventListener('icegatheringstatechange', () => {
+    if (p.iceGatheringState === 'complete') { clearTimeout(t); res(); }
+  });
+});
 
-def grab_frame(max_width, quality):
-    if not hasattr(_local, "sct"):
-        _local.sct = mss.mss()
-    shot = _local.sct.grab(MON)
-    img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-    if img.width > max_width:
-        img = img.resize((max_width, int(img.height * max_width / img.width)), Image.BILINEAR)
-    buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=quality)
-    return buf.getvalue()
+async function connect() {
+  const code = $('code').value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (code.length !== 10) return setMsg('Codes are 10 characters, like K7M2Q-X9P4R.', true);
+  $('go').disabled = true;
+  setMsg('Connecting…');
 
+  const topic = NTFY + 'rdesk-v1-' + code.toLowerCase();
+  const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
 
-def apply_input(m):
-    t = m.get("t")
-    try:
-        if t in ("move", "mouse"):
-            pyautogui.moveTo(MON["left"] + float(m["x"]) * MON["width"],
-                             MON["top"] + float(m["y"]) * MON["height"], _pause=False)
-            if t == "mouse":
-                btn = {0: "left", 1: "middle", 2: "right"}.get(m.get("b"), "left")
-                (pyautogui.mouseDown if m["a"] == "down" else pyautogui.mouseUp)(button=btn, _pause=False)
-        elif t == "wheel":
-            pyautogui.scroll(-int(m["dy"]), _pause=False)
-        elif t == "key":
-            k = KEYMAP.get(m["k"], m["k"].lower())
-            if re.fullmatch(r"f\d{1,2}", k) or k in pyautogui.KEYBOARD_KEYS:
-                (pyautogui.keyDown if m["a"] == "down" else pyautogui.keyUp)(k, _pause=False)
-    except Exception as e:
-        print("input error:", e)
+  try {
+    pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    dc = pc.createDataChannel('screen');
+    dc.binaryType = 'arraybuffer';
+    dc.onmessage = onFrame;
+    dc.onopen = () => {
+      live = true; clearTimeout(timer); setMsg('');
+      $('login').style.display = 'none'; $('stream').style.display = 'block'; canvas.focus();
+      fpsTimer = setInterval(() => { $('fps').textContent = frames + ' fps'; frames = 0; }, 1000);
+      try { es.close(); } catch {}
+    };
+    dc.onclose = () => { if (live) end('Disconnected.'); };
+    pc.onconnectionstatechange = () => {
+      if (['failed', 'closed'].includes(pc.connectionState)) end(live ? 'Connection lost.' : 'Could not establish a connection (network may block it).');
+    };
 
+    // Listen for the host's answer on the private topic
+    es = new EventSource(topic + '/sse');
+    await new Promise((res, rej) => {
+      es.addEventListener('open', res, { once: true });
+      es.onerror = () => rej(new Error('Could not reach the signaling service.'));
+    });
+    es.onerror = null;
+    es.onmessage = async ev => {
+      let e, m;
+      try { e = JSON.parse(ev.data); m = JSON.parse(e.message); } catch { return; }
+      if (e.event !== 'message' || m.id !== id) return;
+      if (m.type === 'answer') await pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });
+      else if (m.type === 'denied') end('The host declined the connection.');
+    };
 
-async def stream(ch, args):
-    loop = asyncio.get_running_loop()
-    fid, last = 0, None
-    print("Viewer connected.")
-    while ch.readyState == "open":
-        if ch.bufferedAmount > 262144:  # viewer is behind; don't pile up frames
-            await asyncio.sleep(0.02)
-            continue
-        frame = await loop.run_in_executor(POOL, grab_frame, args.width, args.quality)
-        h = hashlib.md5(frame).digest()
-        if h != last:  # skip unchanged screens
-            last = h
-            fid = (fid + 1) & 0xFFFFFFFF
-            parts = [frame[i:i + CHUNK] for i in range(0, len(frame), CHUNK)]
-            for i, p in enumerate(parts):
-                ch.send(struct.pack(">IHH", fid, i, len(parts)) + p)
-        await asyncio.sleep(1 / args.fps)
-    print("Viewer disconnected.")
+    await pc.setLocalDescription(await pc.createOffer());
+    await gathered(pc);
+    await fetch(topic, { method: 'POST', body: JSON.stringify({ type: 'offer', id, sdp: pc.localDescription.sdp }) });
+    setMsg('Waiting for the host to approve…');
+    timer = setTimeout(() => { if (!live) end('No response. Check the code and that the host app is running.'); }, 90000);
+  } catch (err) {
+    end(err.message || 'Connection failed.');
+  }
+}
 
+// Frames arrive as chunks: [frameId u32][index u16][total u16][jpeg bytes]
+async function onFrame(e) {
+  if (typeof e.data === 'string') return;
+  const v = new DataView(e.data);
+  const fid = v.getUint32(0), idx = v.getUint16(4), total = v.getUint16(6);
+  if (!cur || cur.fid !== fid) cur = { fid, parts: new Array(total), got: 0, total };
+  if (!cur.parts[idx]) { cur.parts[idx] = new Uint8Array(e.data, 8); cur.got++; }
+  if (cur.got < cur.total) return;
+  const blob = new Blob(cur.parts, { type: 'image/jpeg' });
+  cur = null;
+  if (busy) return;
+  busy = true;
+  try {
+    const bmp = await createImageBitmap(blob);
+    if (canvas.width !== bmp.width || canvas.height !== bmp.height) { canvas.width = bmp.width; canvas.height = bmp.height; }
+    ctx.drawImage(bmp, 0, 0); bmp.close(); frames++;
+  } catch {}
+  busy = false;
+}
 
-async def main(args):
-    raw = "".join(secrets.choice(ALPHABET) for _ in range(10))
-    topic = NTFY + "rdesk-v1-" + raw.lower()
-    state = {"pc": None, "busy": False}
+// ---- remote input ----
+const send = o => { if (dc && dc.readyState === 'open') dc.send(JSON.stringify(o)); };
+function pos(e) {
+  const r = canvas.getBoundingClientRect();
+  const s = Math.min(r.width / canvas.width, r.height / canvas.height);
+  const w = canvas.width * s, h = canvas.height * s;
+  const x = (e.clientX - r.left - (r.width - w) / 2) / w;
+  const y = (e.clientY - r.top - (r.height - h) / 2) / h;
+  return { x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) };
+}
+let pend = null;
+canvas.addEventListener('mousemove', e => {
+  const first = pend === null; pend = pos(e);
+  if (first) requestAnimationFrame(() => { send({ t: 'move', ...pend }); pend = null; });
+});
+canvas.addEventListener('mousedown', e => { e.preventDefault(); canvas.focus(); send({ t: 'mouse', a: 'down', b: e.button, ...pos(e) }); });
+canvas.addEventListener('mouseup', e => { e.preventDefault(); send({ t: 'mouse', a: 'up', b: e.button, ...pos(e) }); });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('wheel', e => { e.preventDefault(); send({ t: 'wheel', dy: e.deltaY }); }, { passive: false });
+canvas.addEventListener('keydown', e => { e.preventDefault(); send({ t: 'key', a: 'down', k: e.key }); });
+canvas.addEventListener('keyup', e => { e.preventDefault(); send({ t: 'key', a: 'up', k: e.key }); });
 
-    print("\n==============================")
-    print(f"  CONNECTION CODE:  {raw[:5]}-{raw[5:]}")
-    print("==============================")
-    print("Enter it on the website. Ctrl+C to stop.\n")
-
-    async with aiohttp.ClientSession() as http:
-        async def publish(obj):
-            await http.post(topic, data=json.dumps(obj))
-
-        async def on_offer(m):
-            if state["busy"]:
-                return
-            state["busy"] = True
-            try:
-                if not args.no_confirm:
-                    ans = await asyncio.to_thread(input, "\nSomeone is requesting access. Allow? [y/N] ")
-                    if ans.strip().lower() != "y":
-                        await publish({"type": "denied", "id": m["id"]})
-                        return
-                if state["pc"]:
-                    await state["pc"].close()
-                pc = RTCPeerConnection(RTCConfiguration([RTCIceServer("stun:stun.l.google.com:19302")]))
-                state["pc"] = pc
-
-                @pc.on("datachannel")
-                def _(ch):
-                    @ch.on("message")
-                    def _(msg):
-                        if isinstance(msg, str) and not args.view_only:
-                            apply_input(json.loads(msg))
-                    asyncio.ensure_future(stream(ch, args))
-
-                @pc.on("connectionstatechange")
-                async def _():
-                    if pc.connectionState in ("failed", "closed"):
-                        await pc.close()
-
-                await pc.setRemoteDescription(RTCSessionDescription(sdp=m["sdp"], type="offer"))
-                await pc.setLocalDescription(await pc.createAnswer())
-                await publish({"type": "answer", "id": m["id"], "sdp": pc.localDescription.sdp})
-            except Exception as e:
-                print("connection error:", e)
-            finally:
-                state["busy"] = False
-
-        while True:  # listen on the private topic, reconnect if dropped
-            try:
-                async with http.get(topic + "/sse", timeout=aiohttp.ClientTimeout(total=None, sock_read=120)) as r:
-                    async for line in r.content:
-                        line = line.decode().strip()
-                        if not line.startswith("data:"):
-                            continue
-                        ev = json.loads(line[5:])
-                        if ev.get("event") != "message":
-                            continue
-                        try:
-                            m = json.loads(ev["message"])
-                        except Exception:
-                            continue
-                        if m.get("type") == "offer":
-                            asyncio.ensure_future(on_offer(m))
-            except Exception:
-                await asyncio.sleep(2)
-
-
-if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--fps", type=int, default=15)
-    p.add_argument("--width", type=int, default=1280, help="max stream width in pixels")
-    p.add_argument("--quality", type=int, default=55, help="JPEG quality 1-95")
-    p.add_argument("--view-only", action="store_true", help="ignore remote mouse/keyboard")
-    p.add_argument("--no-confirm", action="store_true", help="don't ask before accepting a viewer")
-    try:
-        asyncio.run(main(p.parse_args()))
-    except KeyboardInterrupt:
-        print("Stopped.")
+$('go').onclick = connect;
+$('code').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
+$('code').addEventListener('input', e => {
+  let v = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10);
+  e.target.value = v.length > 5 ? v.slice(0, 5) + '-' + v.slice(5) : v;
+});
+$('fs').onclick = () => { $('stream').requestFullscreen(); canvas.focus(); };
+$('dc').onclick = () => end('Disconnected.', false);
+</script>
+</body>
+</html>
